@@ -3,179 +3,570 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <time.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <time.h>
 
-#include "proj2.h" // struct request { char op_status; char name[31]; char len[8]; }
+#include "proj2.h"
 
+/* --- Project constraints --- */
 #define MAX_KEYS 200
 #define STATE_INVALID 0
 #define STATE_BUSY 1
 #define STATE_VALID 2
 
-/* ---------------------------------------------------
-   GLOBALS
-   ---------------------------------------------------*/
-static int g_stop = 0;      // set to 1 when main thread sees "quit"
-static int g_listener_sock; // listener socket FD
-
-// Stats
-static int g_num_objects = 0; // how many valid objects in table
-static int g_read_count = 0;
-static int g_write_count = 0;
-static int g_delete_count = 0;
-static int g_fail_count = 0;
-static int g_queued_count = 0; // how many requests are queued (not yet handled)
-
-// Key table
+/* --- Data for each key --- */
 typedef struct
 {
-    int state;     // 0=invalid,1=busy,2=valid
-    char name[31]; // up to 30 chars + nul
-    int length;    // size of data on disk
-} db_entry_t;
+    char name[32]; // the key (up to 30 chars + null)
+    int state;     // 0=INVALID, 1=BUSY, 2=VALID
+} KeyRecord;
+int g_listen_fd = -1;
 
-static db_entry_t g_table[MAX_KEYS];
+static KeyRecord g_keys[MAX_KEYS]; // Our "table": up to 200 entries
+static pthread_mutex_t g_keys_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// Protect database and stats
-static pthread_mutex_t g_db_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* --- Stats & state tracking --- */
+static int g_num_objects = 0; // how many keys are in VALID state
+static int g_num_write = 0;   // count of W requests
+static int g_num_read = 0;    // count of R requests
+static int g_num_delete = 0;  // count of D requests
+static int g_num_fail = 0;    // count of 'X' responses
+static int g_num_queued = 0;  // requests waiting in queue
 
-/* ---------------------------------------------------
-   WORK QUEUE
-   ---------------------------------------------------*/
-typedef struct work_item
+static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* A global to signal shutdown. Worker threads & listener will stop if set. */
+static int g_shutdown_flag = 0;
+
+/* --- Work queue for incoming requests from the listener --- */
+typedef struct WorkItem
 {
-    int sockfd;
-    struct work_item *next;
-} work_item_t;
+    int client_fd;
+    struct WorkItem *next;
+} WorkItem;
 
-static work_item_t *g_work_head = NULL;
-static work_item_t *g_work_tail = NULL;
+static WorkItem *g_work_head = NULL;
+static WorkItem *g_work_tail = NULL;
+static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_work_cond = PTHREAD_COND_INITIALIZER;
 
-// Protect the queue
-static pthread_mutex_t g_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_queue_cond = PTHREAD_COND_INITIALIZER;
+/******************************************************************************
+ * Enqueue a new socket onto the shared queue.
+ *****************************************************************************/
+static void queue_work(int fd)
+{
+    WorkItem *item = malloc(sizeof(*item));
+    if (!item)
+    {
+        fprintf(stderr, "queue_work: out of memory!\n");
+        return;
+    }
+    item->client_fd = fd;
+    item->next = NULL;
 
-/* ---------------------------------------------------
-   FUNCTION DECLARATIONS
-   ---------------------------------------------------*/
+    pthread_mutex_lock(&g_work_lock);
+    if (!g_work_tail)
+    {
+        g_work_head = g_work_tail = item;
+    }
+    else
+    {
+        g_work_tail->next = item;
+        g_work_tail = item;
+    }
+    g_num_queued++;
+    pthread_cond_signal(&g_work_cond);
+    pthread_mutex_unlock(&g_work_lock);
+}
 
-// Thread main functions
-void *listener_thread(void *arg);
-void *worker_thread(void *arg);
+/******************************************************************************
+ * Pop one socket off the shared queue. Blocks if queue is empty.
+ * Returns -1 if shutting down.
+ *****************************************************************************/
+static int get_work(void)
+{
+    pthread_mutex_lock(&g_work_lock);
 
-// Helpers for queue
-void queue_work(int sockfd);
-int get_work(void);
+    while (!g_shutdown_flag && (g_work_head == NULL))
+    {
+        pthread_cond_wait(&g_work_cond, &g_work_lock);
+    }
+    if (g_shutdown_flag)
+    {
+        pthread_mutex_unlock(&g_work_lock);
+        return -1; // signal to workers to exit
+    }
+    // remove head
+    WorkItem *item = g_work_head;
+    g_work_head = item->next;
+    if (!g_work_head)
+        g_work_tail = NULL;
 
-// Database ops
-int find_key_index(const char *key);
-int find_free_index(void);
-void handle_work(int sockfd);
+    g_num_queued--;
+    int fd = item->client_fd;
+    free(item);
 
-// Main thread commands
-void cmd_stats(void);
-void cmd_quit(void);
+    pthread_mutex_unlock(&g_work_lock);
+    return fd;
+}
 
-// File ops
-int write_data_file(int index, const char *buf, int len);
-int read_data_file(int index, char *buf, int len);
+/******************************************************************************
+ * Utility: find existing key or return -1 if not found.
+ *****************************************************************************/
+static int find_key_index(const char *keyname)
+{
+    for (int i = 0; i < MAX_KEYS; i++)
+    {
+        if (g_keys[i].state != STATE_INVALID &&
+            strncmp(g_keys[i].name, keyname, 31) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
 
-/* ---------------------------------------------------
-   MAIN
-   ---------------------------------------------------*/
+/******************************************************************************
+ * Utility: find a free or invalid slot or return -1 if table full.
+ *****************************************************************************/
+static int find_free_index(void)
+{
+    for (int i = 0; i < MAX_KEYS; i++)
+    {
+        if (g_keys[i].state == STATE_INVALID)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/******************************************************************************
+ * Helper to mark a request as a failure response.
+ * increments 'fail' count, sets response->op_status = 'X'
+ *****************************************************************************/
+static void mark_failure(struct request *resp)
+{
+    pthread_mutex_lock(&g_stats_lock);
+    g_num_fail++;
+    pthread_mutex_unlock(&g_stats_lock);
+
+    resp->op_status = 'X';
+}
+
+/******************************************************************************
+ * Write operation:
+ * 1) possibly find existing key or get a new slot.
+ * 2) mark it BUSY; do the random usleep
+ * 3) write data to /tmp/data.<slot>
+ *****************************************************************************/
+static void handle_write(int client_fd, struct request *req, int data_len)
+{
+    // Update stats
+    pthread_mutex_lock(&g_stats_lock);
+    g_num_write++;
+    pthread_mutex_unlock(&g_stats_lock);
+
+    // We'll read 'data_len' bytes from the socket.
+    char *buf = malloc(data_len);
+    if (!buf)
+    {
+        mark_failure(req);
+        write(client_fd, req, sizeof(*req));
+        return;
+    }
+
+    // read data from the client
+    int total_read = 0;
+    while (total_read < data_len)
+    {
+        int r = read(client_fd, buf + total_read, data_len - total_read);
+        if (r <= 0)
+        {
+            // read error => fail
+            mark_failure(req);
+            write(client_fd, req, sizeof(*req));
+            free(buf);
+            return;
+        }
+        total_read += r;
+    }
+
+    // At this point, we have the data in 'buf'.
+    // Next: find or allocate a slot for the key
+    pthread_mutex_lock(&g_keys_lock);
+
+    // Check if key already exists
+    int idx = find_key_index(req->name);
+    if (idx < 0)
+    {
+        // not found => find free slot
+        idx = find_free_index();
+        if (idx < 0)
+        {
+            // table is full => fail
+            pthread_mutex_unlock(&g_keys_lock);
+            mark_failure(req);
+            write(client_fd, req, sizeof(*req));
+            free(buf);
+            return;
+        }
+        // brand-new key
+        strncpy(g_keys[idx].name, req->name, 31);
+        g_keys[idx].name[31] = '\0';
+        g_keys[idx].state = STATE_BUSY;
+
+        // increment the object count
+        pthread_mutex_lock(&g_stats_lock);
+        g_num_objects++;
+        pthread_mutex_unlock(&g_stats_lock);
+    }
+    else
+    {
+        // if found in VALID or BUSY state => check
+        if (g_keys[idx].state == STATE_BUSY)
+        {
+            // can't write to busy => fail
+            pthread_mutex_unlock(&g_keys_lock);
+            mark_failure(req);
+            write(client_fd, req, sizeof(*req));
+            free(buf);
+            return;
+        }
+        // Otherwise, it's a rewrite of a VALID key => put it to BUSY
+        g_keys[idx].state = STATE_BUSY;
+    }
+
+    pthread_mutex_unlock(&g_keys_lock);
+
+    // Sleep for concurrency stress, per project instructions
+    srandom(time(NULL) ^ pthread_self());
+    usleep(random() % 10000);
+
+    // Write data to /tmp/data.<idx>
+    char filename[64];
+    snprintf(filename, sizeof(filename), "/tmp/data.%d", idx);
+
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0)
+    {
+        // can't open => fail
+        pthread_mutex_lock(&g_keys_lock);
+        // revert slot if we had created it
+        if (g_keys[idx].state == STATE_BUSY)
+        {
+            g_keys[idx].state = STATE_INVALID;
+            g_num_objects--;
+        }
+        pthread_mutex_unlock(&g_keys_lock);
+
+        mark_failure(req);
+        write(client_fd, req, sizeof(*req));
+        free(buf);
+        return;
+    }
+    int written = write(fd, buf, data_len);
+    close(fd);
+
+    if (written != data_len)
+    {
+        // incomplete => fail
+        pthread_mutex_lock(&g_keys_lock);
+        if (g_keys[idx].state == STATE_BUSY)
+        {
+            g_keys[idx].state = STATE_INVALID;
+            g_num_objects--;
+        }
+        pthread_mutex_unlock(&g_keys_lock);
+
+        mark_failure(req);
+        write(client_fd, req, sizeof(*req));
+        free(buf);
+        return;
+    }
+
+    // success => mark state VALID
+    pthread_mutex_lock(&g_keys_lock);
+    g_keys[idx].state = STATE_VALID;
+    pthread_mutex_unlock(&g_keys_lock);
+
+    // respond 'K'
+    req->op_status = 'K';
+    write(client_fd, req, sizeof(*req));
+    free(buf);
+}
+
+/******************************************************************************
+ * Read operation: read back data from /tmp/data.<slot>, if it exists.
+ *****************************************************************************/
+static void handle_read(int client_fd, struct request *req)
+{
+    pthread_mutex_lock(&g_stats_lock);
+    g_num_read++;
+    pthread_mutex_unlock(&g_stats_lock);
+
+    pthread_mutex_lock(&g_keys_lock);
+    int idx = find_key_index(req->name);
+    if (idx < 0 || g_keys[idx].state != STATE_VALID)
+    {
+        // not found or busy => fail
+        pthread_mutex_unlock(&g_keys_lock);
+        mark_failure(req);
+        write(client_fd, req, sizeof(*req));
+        return;
+    }
+
+    // open the file
+    char filename[64];
+    snprintf(filename, sizeof(filename), "/tmp/data.%d", idx);
+
+    int fd = open(filename, O_RDONLY);
+    pthread_mutex_unlock(&g_keys_lock);
+
+    if (fd < 0)
+    {
+        // fail
+        mark_failure(req);
+        write(client_fd, req, sizeof(*req));
+        return;
+    }
+
+    // read the contents
+    char buffer[4096]; // guaranteed max
+    int n = read(fd, buffer, sizeof(buffer));
+    close(fd);
+
+    if (n < 0)
+    {
+        // read error
+        mark_failure(req);
+        write(client_fd, req, sizeof(*req));
+        return;
+    }
+
+    // success => respond with 'K' and length, then data
+    req->op_status = 'K';
+    // store length in ASCII decimal
+    char len_str[8];
+    snprintf(len_str, sizeof(len_str), "%d", n);
+    memcpy(req->len, len_str, 8);
+
+    write(client_fd, req, sizeof(*req));
+    if (n > 0)
+    {
+        write(client_fd, buffer, n);
+    }
+}
+
+/******************************************************************************
+ * Delete operation
+ *****************************************************************************/
+static void handle_delete(int client_fd, struct request *req)
+{
+    pthread_mutex_lock(&g_stats_lock);
+    g_num_delete++;
+    pthread_mutex_unlock(&g_stats_lock);
+
+    pthread_mutex_lock(&g_keys_lock);
+    int idx = find_key_index(req->name);
+    if (idx < 0 || g_keys[idx].state != STATE_VALID)
+    {
+        pthread_mutex_unlock(&g_keys_lock);
+        mark_failure(req);
+        write(client_fd, req, sizeof(*req));
+        return;
+    }
+    // mark as invalid
+    g_keys[idx].state = STATE_INVALID;
+    g_num_objects--;
+    pthread_mutex_unlock(&g_keys_lock);
+
+    // remove on-disk file if needed
+    char filename[64];
+    snprintf(filename, sizeof(filename), "/tmp/data.%d", idx);
+    unlink(filename);
+
+    req->op_status = 'K';
+    write(client_fd, req, sizeof(*req));
+}
+
+/******************************************************************************
+ * Handle one client request on socket 'fd'. Read request, parse it,
+ * perform the operation, and send a response. Then close 'fd'.
+ *****************************************************************************/
+static void handle_client(int fd)
+{
+    struct request req;
+    memset(&req, 0, sizeof(req));
+
+    int r = read(fd, &req, sizeof(req));
+    if (r <= 0)
+    {
+        // no data => just close
+        close(fd);
+        return;
+    }
+    // parse
+    int length = atoi(req.len);
+    char op = req.op_status;
+
+    // If it's a Quit command from the client, we can gracefully set the global
+    // shutdown flag. (Some instructions prefer "quit" only from console, but
+    // here's an example of handling 'Q' from the network side.)
+    if (op == 'Q')
+    {
+        // Mark success back to the client.
+        req.op_status = 'K';
+        write(fd, &req, sizeof(req));
+        close(fd);
+
+        // Set the shutdown flag and wake up any waiting workers.
+        pthread_mutex_lock(&g_work_lock);
+        g_shutdown_flag = 1;
+        pthread_cond_broadcast(&g_work_cond);
+        pthread_mutex_unlock(&g_work_lock);
+        for (int i = 0; i < 4; i++)
+            queue_work(-1);
+        // Close the global listening socket if it's open.
+        if (g_listen_fd != -1)
+        {
+            close(g_listen_fd);
+            g_listen_fd = -1;
+        }
+        return;
+    }
+
+    // W, R, D
+    switch (op)
+    {
+    case 'W':
+        handle_write(fd, &req, length);
+        break;
+    case 'R':
+        handle_read(fd, &req);
+        break;
+    case 'D':
+        handle_delete(fd, &req);
+        break;
+    default:
+        // unknown => fail
+        mark_failure(&req);
+        write(fd, &req, sizeof(req));
+        break;
+    }
+    close(fd);
+}
+
+/******************************************************************************
+ * Worker thread main loop
+ *****************************************************************************/
+static void *worker_thread(void *arg)
+{
+    (void)arg; // unused
+    while (!g_shutdown_flag)
+    {
+        int fd = get_work();
+        if (fd < 0)
+        {
+            // means shutdown
+            break;
+        }
+        handle_client(fd);
+    }
+    return NULL;
+}
+
+/******************************************************************************
+ * Listener thread: accept new connections and queue them
+ *****************************************************************************/
+static void *listener_thread(void *arg)
+{
+    int listen_fd = *((int *)arg);
+    free(arg);
+
+    while (!g_shutdown_flag)
+    {
+        struct sockaddr_in cli_addr;
+        socklen_t cli_len = sizeof(cli_addr);
+
+        int client_fd = accept(listen_fd, (struct sockaddr *)&cli_addr, &cli_len);
+        if (client_fd < 0)
+        {
+            // accept() fails if we have closed listen_fd in main
+            if (g_shutdown_flag)
+            {
+                // This means we intentionally closed it during shutdown
+                break;
+            }
+            perror("accept error");
+            break;
+        }
+        // We have a new connection, enqueue it
+        queue_work(client_fd);
+    }
+    // Cleanup, then exit the thread
+    return NULL;
+}
+/******************************************************************************
+ * Print stats: # objects, # read, # write, # delete, # fail, # queued
+ *****************************************************************************/
+static void print_stats(void)
+{
+    int nobj, nr, nw, nd, nf, nq;
+
+    // Lock g_stats_lock to read the stats it protects
+    pthread_mutex_lock(&g_stats_lock);
+    nobj = g_num_objects;
+    nr = g_num_read;
+    nw = g_num_write;
+    nd = g_num_delete;
+    nf = g_num_fail;
+    pthread_mutex_unlock(&g_stats_lock);
+
+    // Lock g_work_lock to read g_num_queued
+    pthread_mutex_lock(&g_work_lock);
+    nq = g_num_queued;
+    pthread_mutex_unlock(&g_work_lock);
+
+    printf("STATS:\n");
+    printf("  objects:   %d\n", nobj);
+    printf("  reads:     %d\n", nr);
+    printf("  writes:    %d\n", nw);
+    printf("  deletes:   %d\n", nd);
+    printf("  failures:  %d\n", nf);
+    printf("  queued:    %d\n", nq);
+}
+
+/******************************************************************************
+ * Main thread: parse optional port argument, create worker threads, start
+ * the listener thread, then wait for console input: "stats" or "quit".
+ *****************************************************************************/
 int main(int argc, char *argv[])
 {
-    // Optional: delete old files
-    system("rm -f data.*");
+    // Remove old data.* files (optional, but often helpful)
+    system("rm -f /tmp/data.*");
 
-    // Initialize the table
-    memset(g_table, 0, sizeof(g_table));
-
-    // Optional: seed random for usleep
-    srand((unsigned)time(NULL));
-
-    // Parse optional port from command line
     int port = 5000;
     if (argc > 1)
     {
         port = atoi(argv[1]);
         if (port <= 0)
         {
-            fprintf(stderr, "Invalid port: %s\n", argv[1]);
-            exit(1);
+            port = 5000;
         }
     }
 
-    // Create listener thread
-    pthread_t tlistener;
-    if (pthread_create(&tlistener, NULL, listener_thread, &port) != 0)
+    // Initialize the table
+    for (int i = 0; i < MAX_KEYS; i++)
     {
-        perror("pthread_create listener");
-        exit(1);
+        g_keys[i].state = STATE_INVALID;
+        g_keys[i].name[0] = '\0';
     }
-
-    // Create 4 worker threads
-    pthread_t workers[4];
-    for (int i = 0; i < 4; i++)
-    {
-        if (pthread_create(&workers[i], NULL, worker_thread, NULL) != 0)
-        {
-            perror("pthread_create worker");
-            exit(1);
-        }
-    }
-
-    // Main thread: read commands from stdin
-    char line[128];
-    while (!g_stop && fgets(line, sizeof(line), stdin) != NULL)
-    {
-        // remove trailing newline
-        line[strcspn(line, "\n")] = '\0';
-
-        if (strcmp(line, "stats") == 0)
-        {
-            cmd_stats();
-        }
-        else if (strcmp(line, "quit") == 0)
-        {
-            cmd_quit();
-        }
-        else
-        {
-            printf("Unknown command: %s\n", line);
-            printf("Commands: stats, quit\n");
-        }
-    }
-
-    // If user typed "quit", join listener
-    pthread_join(tlistener, NULL);
-
-    // Workers will exit if g_stop=1 and queue is empty
-    // so push a few dummy items with sockfd=-1 to "wake" them
-    for (int i = 0; i < 4; i++)
-    {
-        queue_work(-1);
-    }
-    for (int i = 0; i < 4; i++)
-    {
-        pthread_join(workers[i], NULL);
-    }
-
-    return 0;
-}
-
-/* ---------------------------------------------------
-   LISTENER THREAD
-   ---------------------------------------------------*/
-void *listener_thread(void *arg)
-{
-    int port = *(int *)arg;
 
     // Create listening socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -184,8 +575,8 @@ void *listener_thread(void *arg)
         perror("socket");
         exit(1);
     }
-
-    // Allow immediate rebinding if stuck in TIME_WAIT
+    g_listen_fd = sock;
+    // allow reuse if in TIME_WAIT
     int optval = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
@@ -201,469 +592,88 @@ void *listener_thread(void *arg)
         close(sock);
         exit(1);
     }
-    if (listen(sock, 10) < 0)
+    if (listen(sock, 8) < 0)
     {
         perror("listen");
         close(sock);
         exit(1);
     }
 
-    g_listener_sock = sock;
-    printf("Listening on port %d...\n", port);
+    printf("dbserver: listening on port %d ...\n", port);
 
-    // Accept loop
-    while (!g_stop)
+    // Start 4 worker threads
+    pthread_t workers[4];
+    for (int i = 0; i < 4; i++)
     {
-        int client_fd = accept(sock, NULL, NULL);
-        if (client_fd < 0)
-        {
-            if (errno == EINTR)
-            {
-                // Interrupted by something, keep going
-                continue;
-            }
-            // If user typed "quit" and we closed the socket,
-            // accept might fail with EBADF or similar. So break.
-            if (g_stop)
-                break;
-            perror("accept");
-            break;
-        }
-        // Enqueue this connection for a worker
-        queue_work(client_fd);
+        pthread_create(&workers[i], NULL, worker_thread, NULL);
     }
 
-    // Close listening socket
-    close(sock);
-    return NULL;
-}
+    // Start the listener thread
+    pthread_t lstnr;
+    int *sock_ptr = malloc(sizeof(int));
+    *sock_ptr = sock;
+    pthread_create(&lstnr, NULL, listener_thread, sock_ptr);
 
-/* ---------------------------------------------------
-   WORKER THREAD
-   ---------------------------------------------------*/
-void *worker_thread(void *arg)
-{
-    (void)arg; // unused
-
+    // Main thread: read from stdin for "stats" / "quit"
+    char line[128];
     while (1)
     {
-        int sockfd = get_work();
-        if (sockfd < 0)
+        if (fgets(line, sizeof(line), stdin) == NULL)
         {
-            // This signals we should stop
+            // Instead of quitting immediately on EOF, wait a moment and continue.
+            sleep(1);
+            // Also, if shutdown was requested from a network "quit", break.
+            if (g_shutdown_flag)
+                break;
+            continue;
+        }
+        if (g_shutdown_flag)
             break;
-        }
-        // Handle request
-        handle_work(sockfd);
-        close(sockfd);
-    }
-    return NULL;
-}
 
-/* ---------------------------------------------------
-   QUEUE HELPERS
-   ---------------------------------------------------*/
-void queue_work(int sockfd)
-{
-    work_item_t *item = (work_item_t *)malloc(sizeof(work_item_t));
-    item->sockfd = sockfd;
-    item->next = NULL;
-
-    pthread_mutex_lock(&g_queue_mutex);
-
-    // Insert at tail
-    if (!g_work_head)
-    {
-        g_work_head = item;
-        g_work_tail = item;
-    }
-    else
-    {
-        g_work_tail->next = item;
-        g_work_tail = item;
-    }
-    // Increase queued count if it's a real sock
-    if (sockfd >= 0)
-    {
-        g_queued_count++;
-    }
-
-    pthread_cond_signal(&g_queue_cond);
-    pthread_mutex_unlock(&g_queue_mutex);
-}
-
-int get_work(void)
-{
-    pthread_mutex_lock(&g_queue_mutex);
-
-    while (!g_work_head)
-    {
-        // If stop is requested, we might want to break
-        if (g_stop)
+        if (strncmp(line, "stats", 5) == 0)
         {
-            pthread_mutex_unlock(&g_queue_mutex);
-            return -1;
+            print_stats();
         }
-        pthread_cond_wait(&g_queue_cond, &g_queue_mutex);
-    }
-
-    work_item_t *item = g_work_head;
-    g_work_head = item->next;
-    if (!g_work_head)
-        g_work_tail = NULL;
-
-    int sockfd = item->sockfd;
-    if (sockfd >= 0)
-    {
-        g_queued_count--;
-    }
-    free(item);
-
-    pthread_mutex_unlock(&g_queue_mutex);
-    return sockfd;
-}
-
-/* ---------------------------------------------------
-   HANDLE REQUEST
-   ---------------------------------------------------*/
-void handle_work(int sockfd)
-{
-    struct request req;
-    memset(&req, 0, sizeof(req));
-
-    // Read request header
-    ssize_t n = read(sockfd, &req, sizeof(req));
-    if (n < 0)
-    {
-        perror("read request");
-        pthread_mutex_lock(&g_db_mutex);
-        g_fail_count++;
-        pthread_mutex_unlock(&g_db_mutex);
-        return;
-    }
-    if (n < (ssize_t)sizeof(req))
-    {
-        // Short read, fail
-        pthread_mutex_lock(&g_db_mutex);
-        g_fail_count++;
-        pthread_mutex_unlock(&g_db_mutex);
-        return;
-    }
-
-    char op = req.op_status; // 'W','R','D','Q'
-    int length = atoi(req.len);
-    char key[31];
-    strncpy(key, req.name, 30);
-    key[30] = '\0';
-
-    // If Q, handle quickly
-    if (op == 'Q')
-    {
-        // You can do immediate server shutdown or a response
-        // Here we just set g_stop=1 to signal shutdown
-        // and do not send any response back for QUIT
-        pthread_mutex_lock(&g_db_mutex);
-        g_stop = 1;
-        pthread_mutex_unlock(&g_db_mutex);
-        return;
-    }
-
-    // For a Write, read the data
-    char *wbuf = NULL;
-    if (op == 'W' && length > 0)
-    {
-        wbuf = (char *)malloc(length);
-        ssize_t remaining = length;
-        char *ptr = wbuf;
-        while (remaining > 0)
+        else if (strncmp(line, "quit", 4) == 0)
         {
-            n = read(sockfd, ptr, remaining);
-            if (n <= 0)
-            {
-                // Fail
-                free(wbuf);
-                pthread_mutex_lock(&g_db_mutex);
-                g_fail_count++;
-                pthread_mutex_unlock(&g_db_mutex);
-                return;
-            }
-            ptr += n;
-            remaining -= n;
-        }
-    }
-
-    // We'll build a response
-    struct request resp;
-    memset(&resp, 0, sizeof(resp));
-    // We'll set resp.op_status to 'K' on success or 'X' on fail.
-
-    // Lock the database
-    pthread_mutex_lock(&g_db_mutex);
-
-    // Find or create index
-    int idx = find_key_index(key);
-    int was_found = 1;
-    if (idx < 0 && op == 'W')
-    {
-        // need to find a free
-        idx = find_free_index();
-        was_found = 0;
-    }
-
-    // If we can't find or can't create an index
-    if (idx < 0)
-    {
-        resp.op_status = 'X';
-        g_fail_count++;
-        // stats
-        if (op == 'R')
-            g_read_count++;
-        if (op == 'W')
-            g_write_count++;
-        if (op == 'D')
-            g_delete_count++;
-        goto send_response;
-    }
-
-    // If the entry is busy => fail
-    if (g_table[idx].state == STATE_BUSY && op != 'W')
-    {
-        // we do not allow read/delete of a "busy" item
-        resp.op_status = 'X';
-        g_fail_count++;
-        if (op == 'R')
-            g_read_count++;
-        if (op == 'D')
-            g_delete_count++;
-        goto send_response;
-    }
-
-    // Actually handle the operation
-    switch (op)
-    {
-    case 'W':
-    {
-        g_write_count++;
-        // Mark busy
-        g_table[idx].state = STATE_BUSY;
-        // If it's a newly created entry
-        if (!was_found)
-        {
-            strncpy(g_table[idx].name, key, 30);
-            g_table[idx].name[30] = '\0';
-            // bump number of objects if it was invalid
-            g_num_objects++;
-        }
-
-        // Sleep up to 10ms as required
-        usleep(random() % 10000);
-
-        // Write the data to file
-        int rc = write_data_file(idx, wbuf, length);
-        if (rc < 0)
-        {
-            // fail
-            g_fail_count++;
-            resp.op_status = 'X';
-            // revert changes
-            g_table[idx].state = STATE_INVALID;
-            g_num_objects--;
+            g_shutdown_flag = 1;
+            break;
         }
         else
         {
-            // success
-            g_table[idx].length = length;
-            g_table[idx].state = STATE_VALID;
-            resp.op_status = 'K';
-        }
-        break;
-    }
-    case 'R':
-    {
-        g_read_count++;
-        // Must be in VALID state
-        if (g_table[idx].state != STATE_VALID)
-        {
-            resp.op_status = 'X';
-            g_fail_count++;
-            break;
-        }
-        resp.op_status = 'K';
-        // fill resp.len with file size as string
-        sprintf(resp.len, "%d", g_table[idx].length);
-        break;
-    }
-    case 'D':
-    {
-        g_delete_count++;
-        // Must be in VALID state
-        if (g_table[idx].state != STATE_VALID)
-        {
-            resp.op_status = 'X';
-            g_fail_count++;
-            break;
-        }
-        // Delete
-        g_table[idx].state = STATE_INVALID;
-        g_table[idx].length = 0;
-        g_num_objects--;
-        // Optionally remove the file
-        char fname[64];
-        snprintf(fname, sizeof(fname), "data.%d", idx);
-        unlink(fname);
-
-        resp.op_status = 'K';
-        break;
-    }
-    default:
-    {
-        // unknown op
-        resp.op_status = 'X';
-        g_fail_count++;
-        break;
-    }
-    }
-
-send_response:;
-    // We'll send the response header now
-    // If read was successful, we also send file data
-    write(sockfd, &resp, sizeof(resp));
-
-    // If it was a successful read, send the actual data
-    if (op == 'R' && resp.op_status == 'K')
-    {
-        int file_len = g_table[idx].length;
-        if (file_len > 0)
-        {
-            char *data_buf = (char *)malloc(file_len);
-            if (read_data_file(idx, data_buf, file_len) == file_len)
-            {
-                // Write to socket
-                write(sockfd, data_buf, file_len);
-            }
-            free(data_buf);
+            printf("commands: stats | quit\n");
         }
     }
 
-    pthread_mutex_unlock(&g_db_mutex);
+    // Tell everyone to shut down
+    pthread_mutex_lock(&g_work_lock);
+    g_shutdown_flag = 1;
 
-    // free wbuf if allocated
-    if (wbuf)
-        free(wbuf);
-}
+    /*
+     * Force the listener thread's accept() call to fail
+     * by closing the socket here.
+     */
+    close(sock);
 
-/* ---------------------------------------------------
-   DATABASE HELPER
-   ---------------------------------------------------*/
-int find_key_index(const char *key)
-{
-    for (int i = 0; i < MAX_KEYS; i++)
+    /*
+     * Signal any worker threads waiting for new work.
+     * This is helpful if your workers can block on the queue.
+     */
+    pthread_cond_broadcast(&g_work_cond);
+    pthread_mutex_unlock(&g_work_lock);
+
+    /*
+     * Now join the listener thread,
+     * which should exit promptly because accept() fails.
+     */
+    pthread_join(lstnr, NULL);
+
+    /* Join the worker threads */
+    for (int i = 0; i < 4; i++)
     {
-        if (g_table[i].state != STATE_INVALID &&
-            strncmp(g_table[i].name, key, 31) == 0)
-        {
-            return i;
-        }
+        pthread_join(workers[i], NULL);
     }
-    return -1;
-}
 
-int find_free_index(void)
-{
-    // find an invalid slot
-    for (int i = 0; i < MAX_KEYS; i++)
-    {
-        if (g_table[i].state == STATE_INVALID)
-        {
-            return i;
-        }
-    }
-    return -1; // full
-}
-
-/* ---------------------------------------------------
-   FILE OPS
-   ---------------------------------------------------*/
-int write_data_file(int index, const char *buf, int len)
-{
-    char filename[64];
-    snprintf(filename, sizeof(filename), "data.%d", index);
-
-    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0)
-    {
-        return -1;
-    }
-    int total = 0;
-    while (total < len)
-    {
-        int n = write(fd, buf + total, len - total);
-        if (n < 0)
-        {
-            close(fd);
-            return -1;
-        }
-        total += n;
-    }
-    close(fd);
+    printf("dbserver: shutting down.\n");
     return 0;
-}
-
-int read_data_file(int index, char *buf, int len)
-{
-    char filename[64];
-    snprintf(filename, sizeof(filename), "data.%d", index);
-
-    int fd = open(filename, O_RDONLY);
-    if (fd < 0)
-    {
-        return -1;
-    }
-    int total = 0;
-    while (total < len)
-    {
-        int n = read(fd, buf + total, len - total);
-        if (n < 0)
-        {
-            close(fd);
-            return -1;
-        }
-        if (n == 0)
-        {
-            // EOF
-            break;
-        }
-        total += n;
-    }
-    close(fd);
-    return total;
-}
-
-/* ---------------------------------------------------
-   MAIN THREAD COMMANDS
-   ---------------------------------------------------*/
-void cmd_stats(void)
-{
-    pthread_mutex_lock(&g_db_mutex);
-    printf("------- Stats -------\n");
-    printf("Objects:    %d\n", g_num_objects);
-    printf("Reads:      %d\n", g_read_count);
-    printf("Writes:     %d\n", g_write_count);
-    printf("Deletes:    %d\n", g_delete_count);
-    printf("Failures:   %d\n", g_fail_count);
-    printf("Queued:     %d\n", g_queued_count);
-    printf("---------------------\n");
-    pthread_mutex_unlock(&g_db_mutex);
-}
-
-void cmd_quit(void)
-{
-    printf("Shutting down server...\n");
-    pthread_mutex_lock(&g_db_mutex);
-    g_stop = 1;
-    pthread_mutex_unlock(&g_db_mutex);
-
-    // Close listener so accept() fails
-    shutdown(g_listener_sock, SHUT_RDWR);
-    close(g_listener_sock);
 }
