@@ -1,6 +1,8 @@
+db*
+data*
+
 # Prerequisites
 *.d
-
 # Object files
 *.o
 *.ko

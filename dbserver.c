@@ -1,19 +1,3 @@
-/********************************************************
- * dbserver.c
- *
- * A simple multi-threaded database server for Project 2.
- *
- * Build with:
- *   gcc -Wall -O2 -o dbserver dbserver.c -lpthread
- *
- * Usage:
- *   ./dbserver [port]
- * Then type "stats" or "quit" on stdin to interact.
- *
- * This code is a reference implementation and may need
- * further debugging or tuning based on your environment.
- ********************************************************/
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -92,7 +76,7 @@ int get_work(void);
 // Database ops
 int find_key_index(const char *key);
 int find_free_index(void);
-void handle_request(int sockfd);
+void handle_work(int sockfd);
 
 // Main thread commands
 void cmd_stats(void);
@@ -270,7 +254,7 @@ void *worker_thread(void *arg)
             break;
         }
         // Handle request
-        handle_request(sockfd);
+        handle_work(sockfd);
         close(sockfd);
     }
     return NULL;
@@ -342,7 +326,7 @@ int get_work(void)
 /* ---------------------------------------------------
    HANDLE REQUEST
    ---------------------------------------------------*/
-void handle_request(int sockfd)
+void handle_work(int sockfd)
 {
     struct request req;
     memset(&req, 0, sizeof(req));
