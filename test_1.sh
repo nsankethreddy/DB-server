@@ -16,7 +16,7 @@ check_command() {
 
 check_command "" ./dbtest
 check_command "" ./dbtest --threads 4 --count 2000
-check_command "" ./dbtest --test --threads 10 --count 500
+check_command "" ./dbtest  --threads 10 --count 1500
 check_command "READ: FAILED (X)" ./dbtest --get mykey
 check_command "" ./dbtest --overload
 check_command "ok" ./dbtest --set mykey myvalue
