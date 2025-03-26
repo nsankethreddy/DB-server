@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <time.h>
 #include "proj2.h"
+#include "queue.h"
 
 typedef enum
 {
@@ -43,33 +44,19 @@ static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_shutdown_flag = 0;
 static int g_listen_fd = -1;
 
-typedef struct WorkItem
-{
-    int client_fd;
-    struct WorkItem *next;
-} WorkItem;
-static WorkItem *g_work_head = NULL;
-static WorkItem *g_work_tail = NULL;
+static queue_t *g_work_queue; // Use the provided queue (dummy head)
+
 static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_work_cond = PTHREAD_COND_INITIALIZER;
 
 static void queue_work(int fd)
 {
-    WorkItem *item = malloc(sizeof(*item));
-    if (!item)
+    int *p = malloc(sizeof(int));
+    if (!p)
         return;
-    item->client_fd = fd;
-    item->next = NULL;
+    *p = fd;
     pthread_mutex_lock(&g_work_lock);
-    if (!g_work_tail)
-    {
-        g_work_head = g_work_tail = item;
-    }
-    else
-    {
-        g_work_tail->next = item;
-        g_work_tail = item;
-    }
+    enqueue(g_work_queue, p);
     g_stats.num_queued++;
     pthread_cond_signal(&g_work_cond);
     pthread_mutex_unlock(&g_work_lock);
@@ -78,22 +65,21 @@ static void queue_work(int fd)
 static int get_work(void)
 {
     pthread_mutex_lock(&g_work_lock);
-    while (!g_shutdown_flag && g_work_head == NULL)
-        pthread_cond_wait(&g_work_cond, &g_work_lock);
-    if (g_shutdown_flag)
+    while (!g_shutdown_flag)
     {
-        pthread_mutex_unlock(&g_work_lock);
-        return -1;
+        void *elem = dequeue(g_work_queue);
+        if (elem != NULL)
+        {
+            g_stats.num_queued--;
+            pthread_mutex_unlock(&g_work_lock);
+            int sock = *((int *)elem);
+            free(elem);
+            return sock;
+        }
+        pthread_cond_wait(&g_work_cond, &g_work_lock);
     }
-    WorkItem *item = g_work_head;
-    g_work_head = item->next;
-    if (!g_work_head)
-        g_work_tail = NULL;
-    g_stats.num_queued--;
-    int fd = item->client_fd;
-    free(item);
     pthread_mutex_unlock(&g_work_lock);
-    return fd;
+    return -1;
 }
 
 static int find_key_index(const char *keyname)
@@ -443,6 +429,14 @@ int main(int argc, char *argv[])
         exit(1);
     }
     printf("dbserver: listening on port %d ...\n", port);
+    g_work_queue = malloc(sizeof(queue_t));
+    if (!g_work_queue)
+    {
+        fprintf(stderr, "Failed to allocate work queue\n");
+        exit(1);
+    }
+    g_work_queue->element = NULL;
+    g_work_queue->next = NULL;
     pthread_t workers[4];
     for (int i = 0; i < 4; i++)
         pthread_create(&workers[i], NULL, worker_thread, NULL);

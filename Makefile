@@ -12,8 +12,8 @@ all: $(EXES)
 dbtest: dbtest.c proj2.h
 	gcc $(CFLAGS) -o dbtest dbtest.c $(LDLIBS)
 
-dbserver: dbserver.c proj2.h
-	gcc $(CFLAGS) -o dbserver dbserver.c $(LDLIBS)
+dbtest: dbtest.c queue.c proj2.h queue.h
+	gcc $(CFLAGS) -o dbtest dbtest.c queue.c $(LDLIBS)
 
 clean:
 	rm -f $(EXES) *.o data.[0-9]*
