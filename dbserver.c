@@ -234,6 +234,7 @@ static void handle_read(int client_fd, struct request *req)
         return;
     }
     char buffer[4096];
+    memset(buffer, 0, sizeof(buffer));
     int n = read(fd, buffer, sizeof(buffer));
     close(fd);
     if (n < 0)
@@ -242,11 +243,17 @@ static void handle_read(int client_fd, struct request *req)
         write(client_fd, req, sizeof(*req));
         return;
     }
-    req->op_status = 'K';
-    char len_str[8];
-    snprintf(len_str, sizeof(len_str), "%d", n);
-    memcpy(req->len, len_str, 8);
-    write(client_fd, req, sizeof(*req));
+
+    // Build a new response struct and ensure it is fully initialized.
+    struct request resp;
+    memset(&resp, 0, sizeof(resp)); // Fully zero the structure
+    resp.op_status = 'K';
+    // Copy the name field, if desired (or leave it as is)
+    strncpy(resp.name, req->name, sizeof(resp.name) - 1);
+    // Set the length field properly:
+    snprintf(resp.len, sizeof(resp.len), "%d", n);
+
+    write(client_fd, &resp, sizeof(resp));
     if (n > 0)
         write(client_fd, buffer, n);
 }
@@ -483,6 +490,8 @@ int main(int argc, char *argv[])
     pthread_join(lstnr, NULL);
     for (int i = 0; i < 4; i++)
         pthread_join(workers[i], NULL);
+    // After joining all threads
+    free(g_work_queue);
     printf("dbserver: shutting down.\n");
     return 0;
 }
