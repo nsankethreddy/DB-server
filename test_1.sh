@@ -1,24 +1,26 @@
 #!/bin/bash
-# Run dbtest with default options
-./dbtest > /dev/null 2>&1
 
-# Run with 4 threads and 2000 requests total
-./dbtest --threads 4 --count 2000 > /dev/null 2>&1
+check_command() {
+    expected="$1"
+    shift
+    # Run the command, capture its output, replace newlines with spaces, then trim whitespace.
+    output=$("$@" 2>&1 | tr '\n' ' ' | sed 's/^ *//;s/ *$//')
+    if [ "$output" = "$expected" ]; then
+        echo "Test passed for: $*"
+    else
+        echo "Test failed for: $*"
+        echo "Expected: '$expected'"
+        echo "Got:      '$output'"
+    fi
+}
 
-# Run in test mode with 10 threads and 500 requests per thread (10 simultaneous requests)
-./dbtest --test --threads 10 --count 500 > /dev/null 2>&1
-
-# Send a set command: set key "mykey" to value "myvalue"
-./dbtest --set mykey myvalue > /dev/null 2>&1
-
-# Send a get command: retrieve the value for "mykey"
-./dbtest --get mykey > /dev/null 2>&1
-
-# Send a delete command: delete key "mykey"
-./dbtest --delete mykey > /dev/null 2>&1
-
-# Send a quit command to the server
-./dbtest --quit > /dev/null 2>&1
-
-# Run overload mode to attempt creating more than 200 keys
-./dbtest --overload > /dev/null 2>&1
+check_command "" ./dbtest
+check_command "" ./dbtest --threads 4 --count 2000
+check_command "" ./dbtest --test --threads 10 --count 500
+check_command "READ: FAILED (X)" ./dbtest --get mykey
+check_command "ok" ./dbtest --set mykey myvalue
+check_command '="myvalue"' ./dbtest --get mykey
+check_command "ok" ./dbtest --delete mykey
+check_command "READ: FAILED (X)" ./dbtest --get mykey
+check_command "" ./dbtest --quit
+check_command "can't connect: Connection refused" ./dbtest --overload
